@@ -1,0 +1,335 @@
+---
+title: 'Homework 2: Movie Analytics'
+author: "Balaji"
+date: "11/20/2019"
+output: pdf_document
+---
+
+# Introduction
+Following is the analysis of the Movies dataset from Kaggle. Whether a movie gets rated good or not good depends on various factors. It would be interesting to analyze the effect of these factors on the overall rating. In our model building, we have considered factors such has revenue, budget, runtime, popularity, voting average.
+We have also accounted the effect of Genres on the ratings.
+There may be additional factors as well such as Production House, Language, Country Produced, Date released etc. which may be considered for future analyses, however for the scope of this analysis we will restrict ourselves with fewer variables.
+One of our main intention is to predict whether a movie is good or bad based on a subset of these features from the given dataset. 
+
+We will first start with some exploration and cleaning before the actual model building exercise.
+It was identified that certain attributes such as Genre, language, production countries, production companies are in JSON format. We parsed the Genre JSON field converting it into flags.Eventually, the idea is to identify the effect of Genres on the movie rating.
+
+# High level details
+The main idea here is to join the movies dataset with ratings using the given links. In order to achieve this, we have have done the needed reformatting of the 
+joining attributes.
+The mean of all user ratings for each movie was determined. The movies are then filtered such that only movies containing 5 or more ratings are retained.
+Certain movies with 0 budgets were identified. These were also filtered out from the analysis along with few garbage records.
+
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+library(stringr)
+library(dplyr)
+library(ggplot2)
+#install.packages("gridExtra")
+library(gridExtra)
+library(broom)
+library(jsonlite)
+library(stringr)
+library(tidyr)
+
+
+```
+
+## 1) Import Data : movies_metadata, ratings, links, links_small, ratings_small
+We will read the movies, links and ratings data
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+##Importing data
+setwd("C:/Users/Nameet/Desktop/APA HW2/R/the-movies-dataset/")
+
+movies_metadata <- read.csv('movies_metadata.csv', stringsAsFactors = FALSE)
+#ratings <- read.csv("ratings.csv")
+#links <- read.csv("links.csv")
+links_small <- read.csv("links_small.csv")
+ratings_small <-read.csv("ratings_small.csv")
+```
+
+## 2) Handle JSON attribute - GENERES and join it with movies
+We parse the Generes for the movies, which is typically multivalued.
+For ex. we can have movies that are Action or Comedy alone or some movies which are classified as both action and comedy
+The Genres will be converted to dummy variables (with yes/no value) for each of the genres
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+###Clean before JSON reformatting
+movies_metadata %>% filter(!(adult %in% c("False", "True")))
+movies_metadata <- movies_metadata %>% filter(adult %in% c("False", "True"))
+
+
+######HANDLE JSON GENRES
+
+json <- movies_metadata$genres
+output = data.frame(row.names = c('row', 'id', 'name'))
+for(i in 1:length(json)){ 
+  jsoni = json[i]
+  
+  if(str_count(jsoni) != 2){
+    match_1 = str_locate_all(jsoni,"('id':)(.*?)('name':)")[[1]] 
+    match_2 = str_locate_all(jsoni,"('name':)(.*?)(\\})")[[1]]
+    
+    K = dim(match_1)[1]
+    output_1 = data.frame(row = rep(i,K),id = rep(NA,K))
+    output_2 = data.frame(row = rep(i,K),name = rep(NA,K))
+    
+    for(k in 1:K){
+      output_1$id[k] = str_sub(jsoni,
+                               match_1[k,1]+str_length("id")+4,
+                               match_1[k,2]-str_length("name")-5)
+      output_2$name[k] = str_sub(jsoni,
+                                 match_2[k,1]+str_length("name")+5,
+                                 match_2[k,2]-2)
+    }
+    output = bind_rows(output,c(output_1, output_2))
+  }
+}
+json_genres <- output %>% filter(row != "NA")
+
+merge_genres <- json_genres %>% 
+  select(c(row, name)) %>% 
+  spread(name, name) %>% 
+  rename_at(vars(-row),function(x) paste0("genre_", x)) %>% 
+  mutate_at(vars(-row), function(x) if_else(is.na(x), 0, 1))
+
+merge_movies <- movies_metadata %>% 
+  mutate(
+    flag_collection = str_length(belongs_to_collection) > 2,
+    movie_id = as.numeric(id),
+    row = as.numeric(rownames(movies_metadata))
+  ) %>% 
+  select(movie_id,imdb_id, row, title, budget, original_language,original_title, popularity, release_date, 
+         revenue, runtime, status, video, vote_average,flag_collection)
+
+master <- left_join(merge_movies, merge_genres, by = "row")
+
+movies_metadata=master
+
+######END HANDLE JSON
+
+
+```
+
+## 3) Join Movies with Ratings
+Here we see there are few rows with 0 and 1 value under imdb_id.
+We will refort the imdb id so it can be joined with the links to ratings
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+#We see there are few rows with 0 and 1 value under imdb_id. 
+#Most of imdb_id are 9 char long in the format tt0114709
+unique(nchar(movies_metadata$imdb_id))
+
+#We trim the imdb id format by removing the tt0, tt1 prefixes
+movies_metadata$imdb_id <- str_sub(movies_metadata$imdb_id,start=4,end=9)
+unique(nchar(movies_metadata$imdb_id))
+
+#Remove leading 0s, this is done by simply converting something like
+#00113132 to 113132
+movies_metadata$imdb_id <- as.numeric(movies_metadata$imdb_id)
+
+movies_link <- merge(movies_metadata,links_small, by.x="imdb_id", by.y="imdbId")
+
+##JOIN(merge) movies_link with ratings small by movieId
+movies_link_rat <- merge(movies_link,ratings_small, by="movieId")
+
+#Set 1 for 3.5 stars and above; else set 0
+movies_link_rat = movies_link_rat %>% mutate(GoodMovie = (rating >= 3.5)*1)
+
+```
+
+## 4) Plot average rating by revenue
+Here we group by revnue and rating, then assign score using mean of vote avg.
+
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+revScore = movies_link_rat %>% group_by(revenue,rating) %>% summarise(scoreBar = mean(vote_average))
+
+#boxplot avg voting by revenue
+rev_rounded=revScore$revenue/1000000
+rev_rounded
+plt = ggplot(revScore,aes(x=rev_rounded,y=scoreBar,colour=factor(rating))) + geom_boxplot() + theme_bw(15) + ylab("Avg. vote") + xlab("Revenue (in Millions)") + ggtitle("Average voting by revenue") + scale_color_discrete(name="Ratings") 
+
+plt
+```
+From the above plot, we can see Avg vote apprears to be balanced across the Revenue.
+Some of the highest grossing movies tend to have better ratings.
+Makes sense, because think about movies like Avatar or Titanic which remain one of the highest-grossing movies at the international box office have great ratings. Ofcourse, this cannot be concluded that big budget movies tend to be rated better, infact, we will later see this is otherwise.
+
+# 5) Pre-Logistic regression
+Here we prepare a summary dataframe with needed independent variables.
+In the below plot, you can also find  linear regression output to observe Good Movie vs idependent variables.
+
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+#Change budget and popularity to numeric, need this for mean in the next step when we take mean
+movies_link_rat$budget=as.numeric(movies_link_rat$budget)
+movies_link_rat$popularity=as.numeric(movies_link_rat$popularity)
+
+#prepare a summary before regression
+movie_average_rating = movies_link_rat %>% group_by(original_title) %>%
+  summarize(total_ratings = n(), average_rating =mean(rating), revenue1 = mean(revenue), budget = mean(budget), popularity = mean(popularity), GoodMovie = (average_rating >= 3.5)*1, vote_average = mean(vote_average), runtime = mean(runtime)) %>% filter(total_ratings >=5 & revenue1 !=0 & budget != 0)
+
+
+#run linear regression to observe Good Movie vs idependent variables
+#Eventually plot using grid.arrange
+#revenue_plot<- ggplot(movie_average_rating, aes(x= revenue1, y= GoodMovie))+ geom_point()+stat_smooth(method="glm")
+#revenue_plot
+
+budget_plot<- ggplot(movie_average_rating, aes(x= budget, y= GoodMovie))+ geom_point()+stat_smooth(method="glm")
+#budget_plot
+
+
+popularity_plot<- ggplot(movie_average_rating, aes(x= popularity, y= GoodMovie))+ geom_point()+stat_smooth(method="glm")
+#popularity_plot
+
+vote_plot<- ggplot(movie_average_rating, aes(x= vote_average, y= GoodMovie))+ geom_point()+stat_smooth(method="glm")
+#vote_plot
+
+runtime_plot<- ggplot(movie_average_rating, aes(x=runtime, y= GoodMovie))+ geom_point()+stat_smooth(method="glm")
+#runtime_plot
+
+grid.arrange(budget_plot,popularity_plot,vote_plot,runtime_plot,nrow=3, ncol=2)
+
+```
+
+Interestingly, it is observered higher budget movies tend to get lower ratings.
+One of the possible reason this can be explained is higher expectations associated with high budget movies
+
+# **LOGISTIC REGRESSION**
+The results of the regression indicate the vote average and popularity are positively correlated with a movie being rated as “good”. Runtime, Budget and revenue are negatively correlated with a movie being rated as “good”. However, the p-values generated by the model indicate that only budget and vote average are statistically significant with 95% confidence.
+
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+#Factor GoodMovie
+movie_average_rating$GoodMovie <- as.factor(movie_average_rating$GoodMovie)
+levels(movie_average_rating$GoodMovie) <- c("NOT actually rated Good Movie", "Actually rated Good Movie")
+
+
+logreg = glm(GoodMovie ~ runtime + budget + revenue1 + vote_average + popularity, movie_average_rating, family=binomial)
+
+#exp(coef(logreg))
+
+```
+
+Output of Logistic regression
+```{r}
+summary(logreg)
+
+```
+
+## Predictions for sample inputs
+We now run some predictions for sample inputs. Here we supply in runtime, budget, revenue, vote_average, popularity and average movie rating
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+#Prepare a dataframe with three sets sample to simulate prediction
+df = data.frame(runtime = c(96, 109.9, 120),
+                budget= c(7500000, 35128839, 45000000),
+                revenue1= c(1.235e+07,1.056e+08, 1.211e+08),
+                vote_average= c(5.8182, 6.3698, 7.0000),
+                popularity = c(6.5832, 10.7784, 12.3116))
+df$predicted_probability = round(predict(logreg,df,type="response"),2)
+df
+```
+
+Output indicates big budget longer duration movies tend to get better ratings.
+
+## Pseudo R squared
+Our logit models evaluates to a pseudo R-square of 0.42 -- generally speaking a good range would be 0.2 to 0.4. This indicates the model is performs fairly OK. 
+
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+ll.null <- logreg$null.deviance/-2
+ll.proposed <- logreg$deviance/-2
+
+PseudoR <- (ll.null-ll.proposed) / ll.null
+#PseudoR 
+
+```
+
+## Marginal effect
+Marginal effects were evaluated for the Budget, Popularity, Revenue, Runtime and Vote Average. Because the probability is nonlinear, each variables marginal effect varies depending on its particular value. It was found that at each variable’s mean, a one unit increase in popularity has the greatest impact on the probability of a movie being predicted as good. 
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+j       = 2 #beta of interest (runtime)
+betahat = as.numeric(logreg$coefficients)
+#xi      = c(0,109.9,0,0,0,0)
+xi      = c(0,120,0,0,0,0)
+logitfun = function(y) {return(1/(1+exp(-y)))}
+yhat = t(xi)%*%betahat
+
+#similar to earlier 
+avg_runtime_me <- (logitfun(yhat) * (1 - logitfun(yhat)) * betahat[j])
+avg_runtime_me
+
+j1       = 3 #beta of interest (budget)
+betahat1 = as.numeric(logreg$coefficients)
+xi1      = c(0,0,45000000,0,0,0)
+logitfun = function(y) {return(1/(1+exp(-y)))}
+yhat1 = t(xi1)%*%betahat1
+avg_budget_me <- (logitfun(yhat1) * (1 - logitfun(yhat1)) * betahat1[j1])
+#avg_budget_me
+
+j2       = 4 #beta of interest (revenue)
+betahat2 = as.numeric(logreg$coefficients)
+#xi2     = c(0, 0, 0, 1.056e+08,0,0)
+xi2     = c(0, 0, 0, 121100000,0,0)
+logitfun = function(y) {return(1/(1+exp(-y)))}
+yhat2 = t(xi2)%*%betahat2
+avg_revenue_me <- (logitfun(yhat2) * (1 - logitfun(yhat2)) * betahat2[j2])
+#avg_revenue_me
+
+j3       = 5 #beta of interest (runtime)
+betahat3 = as.numeric(logreg$coefficients)
+xi3     = c(0, 0, 0,0, 7 ,0)
+logitfun = function(y) {return(1/(1+exp(-y)))}
+yhat3 = t(xi3)%*%betahat3
+avg_vote_me <- (logitfun(yhat3) * (1 - logitfun(yhat3)) * betahat3[j3])
+#avg_vote_me
+
+j4       = 6 #beta of interest (vote average)
+betahat4 = as.numeric(logreg$coefficients)
+xi4     = c(0, 0, 0,0,0, 12.3116 )
+logitfun = function(y) {return(1/(1+exp(-y)))}
+yhat4 = t(xi4)%*%betahat3
+avg_pop_me <- (logitfun(yhat4) * (1 - logitfun(yhat4)) * betahat4[j4])
+#avg_pop_me
+
+Marg_Eff_Var_Avg <- c(avg_runtime_me, avg_budget_me, avg_revenue_me, avg_vote_me, avg_pop_me)
+Variable_Name <- c("Runtime", "Budget", "Revenue", "Vote Avg", "Popularity")
+Marg_table <- data.frame(Variable_Name, Marg_Eff_Var_Avg)
+#Marg_table
+
+marge_effect_plt<-ggplot(Marg_table, aes(Variable_Name, Marg_Eff_Var_Avg)) + geom_point()
+
+#marge_effect_plt
+
+```
+# Prediction plot for Fitted values with GoodMovie (known outcome)
+Colored in red are movies that were not rated as good, and the model generally correctly predicts them to have a low probability of being rated good. Colored in green are movies that are rated good, and the model generally correctly predicts them to have a high probability of being rated good.We see the model seems to do a decent job
+
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+predicted_Good_Movie <- data.frame(probability.of.GoodMovie=logreg$fitted.values, GoodMovie=movie_average_rating$GoodMovie)
+
+predicted_Good_Movie <- predicted_Good_Movie[order(predicted_Good_Movie$probability.of.GoodMovie, decreasing = FALSE),]
+
+predicted_Good_Movie$rank <- 1:nrow(predicted_Good_Movie)
+
+final_plt<-ggplot(data=predicted_Good_Movie, aes(x=rank, y=probability.of.GoodMovie)) + geom_point(aes(color=GoodMovie), alpha=1, shape=3,stroke=3) + xlab("Index")+ ylab("Pred(P)Good Rating")
+
+final_plt
+
+```
+
+# Effect of Movie Genre
+We have 18 different genres. Most of them have an effect (statistically significant) on the movie ratings.
+we see certain genres tend to have a negative effect on the overall rating, while others when used as an interation tend to have a positive effect.
+We see that Action comedy movies tend to have possitive effect while only action or only comedy generes alone tend to have negative effect on a movie being rated good
+
+```{r echo=FALSE, results='hide', error=FALSE,message=FALSE,warning=FALSE}
+
+logregAdv = glm(GoodMovie ~ genre_Adventure, movies_link_rat, family=binomial)
+logregAdvCom = glm(GoodMovie ~ genre_Adventure*genre_Comedy, movies_link_rat, family=binomial)
+summary(logregAdv)
+
+summary(logregAdvCom)
+```
+
+```{r}
+tidy(logregAdvCom) %>% mutate(estimate = round(estimate,4),
+                         statistic = round(statistic,4),
+                         p.value = round(p.value,3),
+                         std.error = NULL)
+```
+
